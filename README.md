@@ -46,20 +46,6 @@ D+ Route Finder uses sophisticated algorithms to analyze the topography of your 
 
 ### Quick Start
 
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/elevation-route-finder.git
-cd elevation-route-finder
-```
-
-2. Rename the main file (optional):
-```bash
-# If you want to follow standard naming conventions
-mv elevation_route_finder.py app.py
-```
-
-3. Choose your preferred setup method:
-
 ### Option 1: Using Conda Environment
 
 ```bash
