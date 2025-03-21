@@ -7,14 +7,14 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
     requirements = fh.read().splitlines()
 
 setup(
-    name="elevation-route-finder",
+    name="app",
     version="0.1.0",
-    author="Your Name",
-    author_email="your.email@example.com",
-    description="A Streamlit app for finding routes with maximum elevation gain and steep climbs",
+    author="David De Ridder",
+    author_email="dn.de.ridder@gmail.com",
+    description="dPlus - A Streamlit app for finding routes with maximum elevation gain and steep climbs",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/elevation-route-finder",
+    url="https://github.com/daderidd/dPlus",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -25,7 +25,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "elevation-route-finder=app:main",
+            "dPlus=app:main",
         ],
     },
 )

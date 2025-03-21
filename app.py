@@ -11,6 +11,12 @@ import matplotlib.colors as colors
 from scipy.ndimage import uniform_filter1d
 import pandas as pd
 from typing import Dict, Tuple, List, Optional, Union, Any
+from geopy.distance import geodesic
+import heapq
+from dataclasses import dataclass
+
+if 'selected_climb_index' not in st.session_state:
+    st.session_state.selected_climb_index = 0
 
 # Configuration constants
 MIN_DISTANCE_KM = 5
@@ -21,6 +27,592 @@ OPENTOPODATA_URL = "https://api.opentopodata.org/v1/eudem25m?locations={location
 BATCH_SIZE = 400
 API_PAUSE = 0.1  # Pause between API calls in seconds
 ROLLING_MEAN_WINDOW = 5  # Window size for smoothing grades
+
+@dataclass
+class ClimbSection:
+    """Class to represent a climb section with relevant metrics."""
+    edges: List[Tuple]  # List of (u, v, k) edge identifiers
+    nodes: List  # List of node IDs that make up the path
+    length_m: float  # Total length in meters
+    elevation_gain_m: float  # Total elevation gain in meters
+    avg_grade: float  # Average grade as percentage
+    max_grade: float  # Maximum grade as percentage
+    start_coords: Tuple[float, float]  # (lat, lon) of start
+    end_coords: Tuple[float, float]  # (lat, lon) of end
+    geometry: List[Tuple[float, float]]  # List of (lat, lon) coordinates along the path
+    
+    def get_score(self) -> float:
+        """Calculate a score for ranking climbs based on length, grade and elevation gain."""
+        # Score climbs by prioritizing longer, steeper sections with significant gain
+        return (self.elevation_gain_m * (1 + self.avg_grade / 10))
+
+
+class SteepClimbFinder:
+    """Class to find steep, meaningful climbs within a specified area."""
+    
+    def __init__(self, 
+                 location: str, 
+                 radius_km: float, 
+                 min_climb_length_m: float = 200, 
+                 min_elevation_gain_m: float = 30,
+                 min_avg_grade: float = 5.0,
+                 max_results: int = 10):
+        """
+        Initialize the steep climb finder.
+        
+        Args:
+            location: The starting location as a string
+            radius_km: Search radius in kilometers
+            min_climb_length_m: Minimum length of a climb in meters
+            min_elevation_gain_m: Minimum elevation gain threshold in meters
+            min_avg_grade: Minimum average grade to consider (percent)
+            max_results: Maximum number of results to return
+        """
+        self.location = location
+        self.radius_km = radius_km
+        self.min_climb_length_m = min_climb_length_m
+        self.min_elevation_gain_m = min_elevation_gain_m
+        self.min_avg_grade = min_avg_grade
+        self.max_results = max_results
+        
+        # Initialize with None; will be populated in fetch_network
+        self.G = None
+        self.center_point = None
+        self.climbs = []
+    
+    def fetch_network(self) -> None:
+        """Fetch the street network and add elevation data."""
+        try:
+            st.info(f"Fetching network around {self.location} with {self.radius_km}km radius...")
+            
+            # Get center point coordinates
+            self.center_point = ox.geocode(self.location)
+            
+            # Convert radius to meters and fetch network
+            radius_m = self.radius_km * 1000
+            
+            # For cycling network (prioritizing roads over paths)
+            self.G = ox.graph_from_point(
+                self.center_point, 
+                dist=radius_m, 
+                network_type="drive",  # Use "drive" to focus on roads
+                simplify=True
+            )
+            
+            st.success(f"Network fetched with {len(self.G.nodes)} nodes and {len(self.G.edges)} edges")
+            
+            # Add elevation data
+            try:
+                # Try local elevation service first if available
+                local_elevation_url = "http://localhost:5001/v1/eudem25m?locations={locations}"
+                
+                st.info("Adding elevation data...")
+                try:
+                    original_elevation_url = ox.settings.elevation_url_template
+                    ox.settings.elevation_url_template = local_elevation_url
+                    
+                    self.G = ox.elevation.add_node_elevations_google(
+                        self.G, 
+                        api_key=None,
+                        batch_size=500,
+                        pause=0.01
+                    )
+                    st.success("Added elevation data from local service")
+                    local_success = True
+                except Exception as e:
+                    st.warning(f"Local elevation service failed: {str(e)}. Trying public API...")
+                    local_success = False
+                    
+                # If local service failed, try the public API
+                if not local_success:
+                    public_api_url = "https://api.opentopodata.org/v1/eudem25m?locations={locations}"
+                    ox.settings.elevation_url_template = public_api_url
+                    
+                    self.G = ox.elevation.add_node_elevations_google(
+                        self.G, 
+                        api_key=None,
+                        batch_size=100, 
+                        pause=1.0
+                    )
+                    st.success("Added elevation data from public API")
+                
+                # Calculate edge grades
+                self.G = ox.elevation.add_edge_grades(self.G)
+                
+                # Verify elevation data quality
+                elevations = [data.get('elevation', 0) for _, data in self.G.nodes(data=True)]
+                if elevations:
+                    min_elev = min(elevations)
+                    max_elev = max(elevations)
+                    elevation_range = max_elev - min_elev
+                    
+                    if elevation_range < 10.0:
+                        st.warning(f"Very flat terrain detected (elevation range: {elevation_range:.1f}m). " 
+                                  f"May be difficult to find steep climbs.")
+                    else:
+                        st.info(f"Terrain elevation range: {min_elev:.1f}m to {max_elev:.1f}m " 
+                               f"(range: {elevation_range:.1f}m)")
+                
+                # Restore original settings if modified
+                if 'original_elevation_url' in locals():
+                    ox.settings.elevation_url_template = original_elevation_url
+                    
+            except Exception as e:
+                st.error(f"Error adding elevation data: {str(e)}")
+                raise
+                
+        except Exception as e:
+            st.error(f"Error fetching network: {str(e)}")
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
+            raise
+    
+    def find_climbs(self) -> List[ClimbSection]:
+        """
+        Find steep climbs that meet the criteria with improved overlap handling.
+        
+        Returns:
+            List of ClimbSection objects representing the identified climbs
+        """
+        if self.G is None:
+            st.error("Network not fetched. Please fetch network first.")
+            return []
+        
+        st.info("Analyzing network for steep climbs...")
+        
+        # 1. Find uphill edges with sufficient grade
+        steep_edges = []
+        
+        # First pass: identify candidate edges
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            # Skip edges without grade data
+            if 'grade' not in data:
+                continue
+                
+            grade = data['grade'] * 100 
+            length = data.get('length', 0)
+            
+            # Collect uphill edges meeting minimum grade
+            if grade >= self.min_avg_grade and length > 0:
+                # Store as (u, v, k) with metadata
+                steep_edges.append((u, v, k, {
+                    'grade': grade,
+                    'length': length,
+                    'elevation_gain': length * grade / 100
+                }))
+        
+        # If no steep edges found, return early
+        if not steep_edges:
+            st.warning(f"No edges with grades above {self.min_avg_grade}% found in this area.")
+            return []
+            
+        # 2. Find connected components/sequences of steep edges
+        # Sort edges by node ID to help identify connected segments
+        steep_edges.sort()
+        
+        # Create a specialized graph of just the steep edges
+        steep_graph = nx.DiGraph()
+        
+        # Add edges to the steep graph
+        for u, v, k, data in steep_edges:
+            steep_graph.add_edge(u, v, key=k, **data)
+            
+            # Add node attributes using data from original graph
+            steep_graph.nodes[u].update({
+                'x': self.G.nodes[u].get('x'),
+                'y': self.G.nodes[u].get('y'),
+                'elevation': self.G.nodes[u].get('elevation', 0)
+            })
+            steep_graph.nodes[v].update({
+                'x': self.G.nodes[v].get('x'),
+                'y': self.G.nodes[v].get('y'),
+                'elevation': self.G.nodes[v].get('elevation', 0)
+            })
+        
+        # 3. Identify climb paths using depth-first traversal
+        climb_paths = []
+        
+        # Visit each node as a potential start of a climb
+        for start_node in steep_graph.nodes():
+            # Skip nodes with no outgoing edges
+            if steep_graph.out_degree(start_node) == 0:
+                continue
+                
+            # Perform depth-first traversal to find climb paths
+            self._find_climb_paths_from_node(
+                steep_graph, 
+                start_node, 
+                [], 
+                0, 
+                0, 
+                0, 
+                set(),
+                climb_paths
+            )
+        
+        # 4. Score, filter, and deduplicate paths
+        scored_paths = []
+        
+        # First filter based on minimum requirements and calculate scores
+        for path, data in climb_paths:
+            # Skip if path doesn't meet minimum requirements
+            if (data['length'] < self.min_climb_length_m or 
+                data['elevation_gain'] < self.min_elevation_gain_m or
+                data['avg_grade'] < self.min_avg_grade):
+                continue
+                
+            # Calculate quality score for this climb
+            # Prioritize longer climbs with higher grades and elevation gain
+            score = data['elevation_gain'] * (1 + data['avg_grade'] / 10) * (data['length'] / 1000)
+            
+            # Store for later processing
+            scored_paths.append((path, data, score))
+        
+        # No valid paths after filtering
+        if not scored_paths:
+            st.warning(f"No climbs meeting the minimum criteria found. Try adjusting parameters.")
+            return []
+            
+        # Sort by score (descending)
+        scored_paths.sort(key=lambda x: x[2], reverse=True)
+        
+        # 5. Process paths to avoid excessive overlap
+        climbs = []
+        processed_segments = set()  # Track already included segments
+        
+        for path, data, score in scored_paths:
+            # Create a set of edge tuples representing this path
+            path_segments = set()
+            for i in range(len(path) - 1):
+                # Create a segment identifier (u, v)
+                path_segments.add((path[i], path[i+1]))
+            
+            # Calculate overlap with already processed segments
+            if processed_segments:
+                # Number of overlapping segments
+                overlap_count = len(path_segments.intersection(processed_segments))
+                # Percentage of this path that overlaps with existing paths
+                overlap_percentage = overlap_count / len(path_segments)
+                
+                # Skip if overlap is too high (adjustable threshold)
+                if overlap_percentage > 0.4:  # 40% overlap threshold
+                    continue
+            
+            # Path passed overlap check, extract geometry and prepare climb object
+            # Get coordinates for visualization
+            geometry = []
+            try:
+                # Try to get detailed geometry if available
+                for i in range(len(path) - 1):
+                    u, v = path[i], path[i+1]
+                    edge_data = steep_graph[u][v]
+                    
+                    if 'geometry' in edge_data:
+                        # LineString from OSMnx has (lon, lat) ordering
+                        geom = edge_data['geometry']
+                        # Convert to (lat, lon) for Folium
+                        coords = [(lat, lon) for lon, lat in geom.coords]
+                        geometry.extend(coords)
+                    else:
+                        # Fallback to node coordinates
+                        geometry.append((steep_graph.nodes[u]['y'], steep_graph.nodes[u]['x']))
+                        geometry.append((steep_graph.nodes[v]['y'], steep_graph.nodes[v]['x']))
+            except Exception:
+                # Fallback: use node coordinates directly
+                geometry = [(steep_graph.nodes[n]['y'], steep_graph.nodes[n]['x']) for n in path]
+            
+            # Remove duplicate consecutive points
+            clean_geometry = []
+            for point in geometry:
+                if not clean_geometry or point != clean_geometry[-1]:
+                    clean_geometry.append(point)
+            
+            # Create start and end coordinates
+            if clean_geometry:
+                start_coords = clean_geometry[0]
+                end_coords = clean_geometry[-1]
+            else:
+                # Fallback
+                start_coords = (steep_graph.nodes[path[0]]['y'], steep_graph.nodes[path[0]]['x'])
+                end_coords = (steep_graph.nodes[path[-1]]['y'], steep_graph.nodes[path[-1]]['x'])
+            
+            # Create edge identification tuples
+            edges = []
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i+1]
+                # Get the key (k) for this edge
+                for k in steep_graph[u][v]:
+                    edges.append((u, v, k))
+                    break
+            
+            # Create ClimbSection object
+            climb = ClimbSection(
+                edges=edges,
+                nodes=path,
+                length_m=data['length'],
+                elevation_gain_m=data['elevation_gain'],
+                avg_grade=data['avg_grade'],
+                max_grade=data['max_grade'],
+                start_coords=start_coords,
+                end_coords=end_coords,
+                geometry=clean_geometry
+            )
+            
+            # Add to results and update processed segments
+            climbs.append(climb)
+            processed_segments.update(path_segments)
+            
+            # Limit to max_results
+            if len(climbs) >= self.max_results:
+                break
+        
+        # Final sort of selected climbs by score
+        climbs.sort(key=lambda x: x.get_score(), reverse=True)
+        
+        st.success(f"Found {len(climbs)} significant climbs with minimal overlap")
+        self.climbs = climbs
+        return climbs
+    
+    def _find_climb_paths_from_node(self, 
+                                    graph: nx.DiGraph, 
+                                    current: Any, 
+                                    path: List, 
+                                    length: float, 
+                                    gain: float, 
+                                    max_grade: float,
+                                    visited: set,
+                                    results: List) -> None:
+        """
+        Recursively find climb paths from a starting node using depth-first traversal.
+        
+        Args:
+            graph: NetworkX graph of steep edges
+            current: Current node
+            path: Current path (list of nodes)
+            length: Accumulated path length
+            gain: Accumulated elevation gain
+            max_grade: Maximum grade encountered
+            visited: Set of visited nodes (to prevent cycles)
+            results: List to collect results
+        """
+        # Add current node to path
+        path = path + [current]
+        visited = visited.copy()
+        visited.add(current)
+        
+        # If path has more than one node, it's a potential climb
+        if len(path) > 1:
+            # Calculate average grade for the current path
+            avg_grade = (gain / length * 100) if length > 0 else 0
+            
+            # Record as a potential climb if it meets minimum requirements
+            if (length >= self.min_climb_length_m and 
+                gain >= self.min_elevation_gain_m and 
+                avg_grade >= self.min_avg_grade):
+                
+                # Store as (path, metadata)
+                results.append((path.copy(), {
+                    'length': length,
+                    'elevation_gain': gain,
+                    'avg_grade': avg_grade,
+                    'max_grade': max_grade
+                }))
+        
+        # Get neighbor nodes (outgoing edges)
+        for neighbor in graph.successors(current):
+            # Skip if already visited (avoid cycles)
+            if neighbor in visited:
+                continue
+                
+            # Get edge data
+            edge_data = graph[current][neighbor]
+            
+            # OSMnx might have multiple edges between same nodes, get first one
+            if isinstance(edge_data, dict) and not isinstance(edge_data, nx.classes.coreviews.AtlasView):
+                # Single edge
+                edge = edge_data
+            else:
+                # Multiple edges, get the one with highest grade
+                edge = max(edge_data.values(), key=lambda x: x.get('grade', 0))
+            
+            # Get edge attributes
+            edge_length = edge.get('length', 0)
+            edge_grade = edge.get('grade', 0)
+            edge_gain = edge_length * edge_grade / 100
+            
+            # Update max grade
+            new_max_grade = max(max_grade, edge_grade)
+            
+            # Only continue if this edge is uphill
+            if edge_grade >= self.min_avg_grade:
+                # Recursively explore from neighbor
+                self._find_climb_paths_from_node(
+                    graph,
+                    neighbor,
+                    path,
+                    length + edge_length,
+                    gain + edge_gain,
+                    new_max_grade,
+                    visited,
+                    results
+                )
+    
+    def visualize_climbs(self) -> folium.Map:
+        """
+        Create a visualization of the identified climbs that follows actual road geometry.
+        
+        Returns:
+            folium.Map object with visualized climbs
+        """
+        if not self.climbs:
+            st.warning("No climbs to visualize. Run find_climbs() first.")
+            return None
+        
+        # Find center point from original center or first climb
+        if self.center_point:
+            map_center = (self.center_point[0], self.center_point[1])
+        elif self.climbs:
+            map_center = self.climbs[0].start_coords
+        else:
+            # Fallback to a default center from network
+            nodes_df = ox.graph_to_gdfs(self.G, edges=False)
+            map_center = (nodes_df['y'].mean(), nodes_df['x'].mean())
+        
+        # Create map
+        m = folium.Map(
+            location=map_center,
+            zoom_start=14,
+            tiles="cartodbpositron"
+        )
+        
+        # Create colormap for climbs
+        cmap = cm.get_cmap('plasma', len(self.climbs))
+        
+        # Add circle marker for center point
+        folium.CircleMarker(
+            location=map_center,
+            radius=10,
+            color='blue',
+            fill=True,
+            fill_opacity=0.7,
+            tooltip=f"Center: {self.location}"
+        ).add_to(m)
+        
+        # Add circles to show search radius
+        folium.Circle(
+            location=map_center,
+            radius=self.radius_km * 1000,  # Convert to meters
+            color='blue',
+            weight=2,
+            fill=False,
+            opacity=0.5,
+            tooltip=f"Search radius: {self.radius_km}km"
+        ).add_to(m)
+        
+        # Add each climb with a different color
+        for i, climb in enumerate(self.climbs):
+            # Generate color for this climb
+            color = colors.rgb2hex(cmap(i / len(self.climbs)))
+            
+            # Collect detailed road geometry for this climb
+            detailed_geometry = []
+            
+            for j in range(len(climb.nodes) - 1):
+                u, v = climb.nodes[j], climb.nodes[j+1]
+                
+                # Get the edge data between these nodes
+                if self.G.has_edge(u, v):
+                    # There might be multiple edges between u and v, get all of them
+                    edge_data = self.G[u][v]
+                    
+                    # If there are multiple edges, find the one with the right key
+                    # or just take the first one if we can't find a perfect match
+                    edge_geometry = None
+                    
+                    # Try to find an edge with geometry data
+                    for k, data in edge_data.items():
+                        if 'geometry' in data:
+                            # Found edge with geometry
+                            geom = data['geometry']
+                            # Convert to (lat, lon) for Folium (OSMnx stores as lon, lat)
+                            coords = [(lat, lon) for lon, lat in geom.coords]
+                            edge_geometry = coords
+                            break
+                    
+                    if edge_geometry:
+                        # Add the detailed geometry
+                        detailed_geometry.extend(edge_geometry)
+                    else:
+                        # Fallback to node coordinates if no geometry found
+                        detailed_geometry.append((self.G.nodes[u]['y'], self.G.nodes[u]['x']))
+                        detailed_geometry.append((self.G.nodes[v]['y'], self.G.nodes[v]['x']))
+                else:
+                    # Edge not found, use node coordinates
+                    detailed_geometry.append((self.G.nodes[u]['y'], self.G.nodes[u]['x']))
+                    detailed_geometry.append((self.G.nodes[v]['y'], self.G.nodes[v]['x']))
+            
+            # Use the detailed geometry if available, otherwise fall back to the original
+            geometry_to_use = detailed_geometry if detailed_geometry else climb.geometry
+            
+            # Remove duplicate consecutive points
+            clean_geometry = []
+            for point in geometry_to_use:
+                if not clean_geometry or point != clean_geometry[-1]:
+                    clean_geometry.append(point)
+            
+            # Add polyline for climb
+            folium.PolyLine(
+                clean_geometry,
+                color=color,
+                weight=5,
+                opacity=0.8,
+                tooltip=f"Climb {i+1}: {climb.length_m:.0f}m, {climb.avg_grade:.1f}%, {climb.elevation_gain_m:.0f}m gain"
+            ).add_to(m)
+            
+            # Add markers for start and end
+            folium.Marker(
+                climb.start_coords,
+                icon=folium.Icon(icon='play', color='green'),
+                tooltip=f"Start of climb {i+1}"
+            ).add_to(m)
+            
+            folium.Marker(
+                climb.end_coords,
+                icon=folium.Icon(icon='flag', color='red'),
+                tooltip=f"End of climb {i+1}"
+            ).add_to(m)
+            
+            # Add a label with climb number
+            folium.map.Marker(
+                climb.start_coords,
+                icon=DivIcon(
+                    icon_size=(20, 20),
+                    icon_anchor=(0, 0),
+                    html=f'<div style="font-size: 12pt; color: white; background-color: {color}; border-radius: 50%; width: 25px; height: 25px; text-align: center; line-height: 25px;">{i+1}</div>'
+                )
+            ).add_to(m)
+        
+        # Add legend
+        legend_html = """
+        <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000; background-color: white; 
+                    padding: 10px; border: 2px solid grey; border-radius: 5px">
+            <p><b>Climbs by Rank</b></p>
+        """
+        
+        # Add entry for each climb
+        for i, climb in enumerate(self.climbs):
+            color = colors.rgb2hex(cmap(i / len(self.climbs)))
+            legend_html += f"""
+            <div style="display: flex; align-items: center; margin-bottom: 5px;">
+                <span style="background-color: {color}; width: 20px; height: 20px; display: inline-block; margin-right: 5px;"></span>
+                <span>#{i+1}: {climb.length_m:.0f}m @ {climb.avg_grade:.1f}% ({climb.elevation_gain_m:.0f}m gain)</span>
+            </div>
+            """
+            
+        legend_html += "</div>"
+        m.get_root().html.add_child(folium.Element(legend_html))
+        
+        return m
 
 class ElevationRouteOptimizer:
     """Enhanced class to handle route optimization for maximizing elevation gain with multiple strategies."""
@@ -1334,7 +1926,7 @@ class ElevationRouteOptimizer:
         return length, elevation_gain, elevation_loss, grades
 
     def visualize_route(self):
-        """Visualize route with segment-level coloring based on grade."""
+        """Visualize route with segment-level coloring based on grade, following actual road geometry."""
         if self.route is None:
             st.error("No route to visualize. Please find a route first.")
             return None
@@ -1344,79 +1936,73 @@ class ElevationRouteOptimizer:
             st.error("Route has insufficient nodes for visualization.")
             return None
         
-        # Extract route coordinates directly from nodes
-        route_coords = []
-        route_grades = []
+        # Extract route coordinates and grades
+        route_segments = []  # Will store tuples of (coordinates, grade)
         
-        # Process route segments using direct node coordinates
+        # Process route segments to extract detailed geometry
         for idx, (u, v) in enumerate(zip(self.route[:-1], self.route[1:])):
-            # Safely extract node coordinates
-            if 'y' in self.G.nodes[u] and 'x' in self.G.nodes[u] and 'y' in self.G.nodes[v] and 'x' in self.G.nodes[v]:
-                u_coords = (self.G.nodes[u]['y'], self.G.nodes[u]['x'])
-                v_coords = (self.G.nodes[v]['y'], self.G.nodes[v]['x'])
+            # Skip if nodes don't exist in graph
+            if not self.G.has_edge(u, v):
+                continue
                 
-                # Get edge grade with defensive error handling
-                try:
-                    edge_data = min(self.G[u][v].values(), key=lambda x: x.get('length', float('inf')))
-                    grade = edge_data.get('grade', 0)
-                except Exception as e:
-                    st.warning(f"Error retrieving grade for segment ({u},{v}): {str(e)}")
-                    grade = 0
-                    
-                # Always add the first coordinate
-                if idx == 0 or len(route_coords) == 0:
-                    route_coords.append(u_coords)
-                    
-                # Always add the second coordinate
-                route_coords.append(v_coords)
-                
-                # Add corresponding grade for this segment
-                route_grades.append(grade)
+            # Get all edges between these nodes (could be multiple)
+            edge_data_options = self.G[u][v]
+            
+            # Default to direct coordinates if we can't find geometry
+            u_coords = (self.G.nodes[u]['y'], self.G.nodes[u]['x'])
+            v_coords = (self.G.nodes[v]['y'], self.G.nodes[v]['x'])
+            
+            # Find the edge with best data (prioritize ones with geometry)
+            best_edge_data = None
+            best_key = None
+            
+            for k, data in edge_data_options.items():
+                if best_edge_data is None or 'geometry' in data:
+                    best_edge_data = data
+                    best_key = k
+            
+            # Extract grade for this segment
+            grade = best_edge_data.get('grade', 0)
+            
+            # Get detailed geometry if available
+            segment_coords = []
+            if 'geometry' in best_edge_data:
+                # LineString geometry from OSMnx has (lon, lat) ordering
+                geom = best_edge_data['geometry']
+                # Convert to (lat, lon) for Folium
+                segment_coords = [(lat, lon) for lon, lat in geom.coords]
+            else:
+                # Fallback to simple straight line
+                segment_coords = [u_coords, v_coords]
+            
+            # Store the segment with its grade
+            route_segments.append((segment_coords, grade))
         
         # Verify we have sufficient data
-        if len(route_coords) < 2 or len(route_grades) < 1:
-            st.error("Insufficient route data for visualization")
+        if not route_segments:
+            st.error("No valid segments found for visualization")
             return None
-            
-        # Ensure grades array matches coordinate segments
-        # One more coord than grade (n+1 points for n segments)
-        if len(route_coords) != len(route_grades) + 1:
-            # Fix by replicating last grade if needed
-            while len(route_coords) > len(route_grades) + 1:
-                route_grades.append(route_grades[-1] if route_grades else 0)
-            # Trim excess coordinates if needed
-            while len(route_coords) < len(route_grades) + 1:
-                route_grades.pop()
         
-        # Smooth grades for visualization
-        smoothed_grades = route_grades
-        if len(route_grades) >= ROLLING_MEAN_WINDOW:
-            try:
-                smoothed_grades = uniform_filter1d(
-                    route_grades, 
-                    size=ROLLING_MEAN_WINDOW, 
-                    mode='nearest'
-                )
-            except Exception as e:
-                st.warning(f"Grade smoothing failed: {str(e)}")
+        # Extract starting point for map centering
+        first_segment = route_segments[0]
+        first_point = first_segment[0][0] if first_segment[0] else (
+            self.G.nodes[self.route[0]]['y'], 
+            self.G.nodes[self.route[0]]['x']
+        )
         
-        # Create map centered at the first point of the route
+        # Create map centered at the first point
         map_obj = folium.Map(
-            location=route_coords[0],
+            location=first_point,
             zoom_start=13,
             tiles="cartodbpositron"
         )
         
-        # Create colormap with bounds checking
+        # Create colormap for grade visualization
         norm = colors.Normalize(vmin=-10, vmax=10)
         cmap = cm.RdYlGn
         
-        # Add route segments with color based on grade
-        for i in range(len(route_coords) - 1):
-            segment_coords = [route_coords[i], route_coords[i+1]]
-            grade_idx = min(i, len(smoothed_grades) - 1)  # Prevent index errors
-            grade = smoothed_grades[grade_idx]
-            
+        # Add segments with color based on grade
+        for segment_coords, grade in route_segments:
             # Get color with error handling
             try:
                 color = colors.rgb2hex(cmap(norm(grade)))
@@ -1434,12 +2020,12 @@ class ElevationRouteOptimizer:
         
         # Add markers for start/end
         folium.Marker(
-            route_coords[0],
+            first_point,
             tooltip="Start/End",
             icon=folium.Icon(color="green", icon="flag"),
         ).add_to(map_obj)
         
-        # Add legend (unchanged)
+        # Add legend
         legend_html = """
         <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000; background-color: white; 
                     padding: 10px; border: 2px solid grey; border-radius: 5px">
@@ -1460,168 +2046,509 @@ class ElevationRouteOptimizer:
         return map_obj
 
 
+# Helper functions for the steep climb finder functionality
+def get_mime_type(export_format):
+    """Return the appropriate MIME type for download button."""
+    mime_types = {
+        "GPX": "application/gpx+xml",
+        "CSV": "text/csv",
+        "GeoJSON": "application/geo+json"
+    }
+    return mime_types.get(export_format, "text/plain")
+
+def prepare_export_data(climbs, format_type):
+    """Prepare climb data for export in various formats."""
+    if format_type == "GPX":
+        # Create GPX file with each climb as a track
+        gpx_data = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        gpx_data += '<gpx version="1.1" creator="D+ Steep Climb Finder" xmlns="http://www.topografix.com/GPX/1/1">\n'
+        
+        for i, climb in enumerate(climbs):
+            gpx_data += f'  <trk>\n    <name>Climb {i+1}: {climb.length_m:.0f}m @ {climb.avg_grade:.1f}%</name>\n    <trkseg>\n'
+            
+            # Add trackpoints
+            for lat, lon in climb.geometry:
+                gpx_data += f'      <trkpt lat="{lat}" lon="{lon}"></trkpt>\n'
+                
+            gpx_data += '    </trkseg>\n  </trk>\n'
+            
+        gpx_data += '</gpx>'
+        return gpx_data
+        
+    elif format_type == "CSV":
+        # Create CSV with climb details
+        csv_data = "Climb,Length (m),Elevation Gain (m),Average Grade (%),Maximum Grade (%),Start Latitude,Start Longitude,End Latitude,End Longitude\n"
+        
+        for i, climb in enumerate(climbs):
+            csv_data += f"{i+1},{climb.length_m:.1f},{climb.elevation_gain_m:.1f},{climb.avg_grade:.2f},{climb.max_grade:.2f},{climb.start_coords[0]},{climb.start_coords[1]},{climb.end_coords[0]},{climb.end_coords[1]}\n"
+            
+        return csv_data
+        
+    elif format_type == "GeoJSON":
+        # Create GeoJSON with each climb as a feature
+        geojson_data = {
+            "type": "FeatureCollection",
+            "features": []
+        }
+        
+        for i, climb in enumerate(climbs):
+            feature = {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[lon, lat] for lat, lon in climb.geometry]  # GeoJSON uses [lon, lat] order
+                },
+                "properties": {
+                    "id": i + 1,
+                    "name": f"Climb {i+1}",
+                    "length_m": round(climb.length_m, 1),
+                    "elevation_gain_m": round(climb.elevation_gain_m, 1),
+                    "avg_grade": round(climb.avg_grade, 2),
+                    "max_grade": round(climb.max_grade, 2)
+                }
+            }
+            geojson_data["features"].append(feature)
+            
+        import json
+        return json.dumps(geojson_data, indent=2)
+    
+    return ""
+
+def generate_elevation_profile(climb, graph):
+    """Generate an elevation profile chart for a climb."""
+    import matplotlib.pyplot as plt
+    from scipy.interpolate import interp1d
+    
+    # Extract node elevations along the path
+    elevations = []
+    distances = []
+    cumulative_distance = 0
+    
+    # Get elevation and distance data
+    for i in range(len(climb.nodes) - 1):
+        u, v = climb.nodes[i], climb.nodes[i + 1]
+        
+        # Get node elevations
+        u_elev = graph.nodes[u].get('elevation', 0)
+        v_elev = graph.nodes[v].get('elevation', 0)
+        
+        # Get edge length - find the right edge if multiple exist
+        edge_data = min(graph[u][v].values(), key=lambda x: x.get('length', float('inf')))
+        edge_length = edge_data.get('length', 0)
+        
+        # Add start point if this is the first segment
+        if i == 0:
+            elevations.append(u_elev)
+            distances.append(cumulative_distance)
+            
+        # Add end point
+        elevations.append(v_elev)
+        cumulative_distance += edge_length
+        distances.append(cumulative_distance)
+    
+    # Create the figure
+    fig, ax = plt.subplots(figsize=(10, 4))
+    
+    # Plot elevation profile
+    ax.plot(distances, elevations, 'b-', linewidth=2.5)
+    ax.fill_between(distances, elevations, min(elevations), alpha=0.3, color='skyblue')
+    
+    # Add labels and grid
+    ax.set_xlabel('Distance (meters)')
+    ax.set_ylabel('Elevation (meters)')
+    ax.set_title(f'Elevation Profile: {climb.length_m:.0f}m @ {climb.avg_grade:.1f}%, {climb.elevation_gain_m:.0f}m gain')
+    ax.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add key stats as text annotation
+    stats_text = (
+        f"Length: {climb.length_m:.0f}m\n"
+        f"Elevation Gain: {climb.elevation_gain_m:.0f}m\n"
+        f"Average Grade: {climb.avg_grade:.1f}%\n"
+        f"Maximum Grade: {climb.max_grade:.1f}%"
+    )
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # Set y-axis limits with some padding
+    min_elev = min(elevations)
+    max_elev = max(elevations)
+    y_range = max_elev - min_elev
+    ax.set_ylim(min_elev - 0.1 * y_range, max_elev + 0.1 * y_range)
+    
+    # Add horizontal distance markers every 100m
+    marker_interval = 100  # meters
+    for d in range(0, int(max(distances)), marker_interval):
+        if d <= max(distances):
+            ax.axvline(x=d, color='gray', linestyle=':', alpha=0.5)
+    
+    plt.tight_layout()
+    return fig
+
 def main():
+    # Tab-specific session state initialization
+    if 'climb_results' not in st.session_state:
+        st.session_state.climb_results = []
+
     st.set_page_config(
         page_title="Elevation Route Finder",
         page_icon="🚵‍♂️",
         layout="wide"
     )
     st.title("🚵‍♂️ D+ - Si toi aussi tu veux des mollets musclay 🦵") 
-    st.markdown(
-        """
-        Trouve des itinéraires de vélo ou de course à pied qui maximisent le d+
-        """
-    )
     
+    # Create tabs for different app functions
+    tab1, tab2 = st.tabs(["Route Finder", "Steep Climb Finder"])
     
-    # Create sidebar for inputs
-    st.sidebar.header("Route Parameters")
-    
-    
-    # Location input
-    location = st.sidebar.text_input(
-        "Starting location:",
-        value="Piedmont, California, USA",
-        help="Enter an address, city, or place name"
-    )
-    
+    with tab1:
+        # Route Finder tab-specific session state
+        if 'route_results' not in st.session_state:
+            st.session_state.route_results = None
+        st.markdown(
+            """
+            Trouve des itinéraires de vélo ou de course à pied qui maximisent le d+
+            """
+        )
+        
+        # Create sidebar for inputs
+        st.sidebar.header("Route Parameters")
+        
+        # Location input
+        location = st.sidebar.text_input(
+            "Starting location:",
+            value="Quai Gustave Ador 23, 1207 Genève",
+            help="Enter an address, city, or place name",
+            key="route_location"
+        )
+        
         # Activity type selection
-    activity_type = st.sidebar.radio(
-        "Select activity type:",
-        options=["cycling", "running"],
-        index=0,
-        key="activity_type"
-    )
-    
-    # Dynamic distance range based on activity type
-    if activity_type == "running":
-        min_distance = 3
-        max_distance = 50
-        default_distance = 10
-    else:  # cycling
-        min_distance = 5
-        max_distance = 100
-        default_distance = 25
-    
-    # Distance selection with dynamic range
-    distance_km = st.sidebar.slider(
-        "Route distance (km):",
-        min_value=min_distance,
-        max_value=max_distance,
-        value=default_distance,
-        step=DISTANCE_STEP,
-        help="Select your desired route distance in kilometers",
-        key="distance_km"
-    )
-    
-    # Add algorithm strategy selection
-    strategy = st.sidebar.selectbox(
-        "Route finding strategy:",
-        options=["greedy", "optimized", "thorough"],
-        index=1,  # Default to optimized
-        help="Select algorithm strategy: greedy (fastest), optimized (balanced), or thorough (best quality but slowest)"
-    )
-    
-    # Add strategy descriptions
-    strategy_info = {
-        "greedy": "Fastest option (15-30 seconds). Produces good routes by incrementally building a path that prioritizes uphill segments.",
-        "optimized": "Balanced option (1-3 minutes). Uses intelligent sampling to find high-quality routes while maintaining reasonable performance.",
-        "thorough": "Highest quality option (5-15+ minutes). Extensively searches for the optimal route with maximum elevation gain."
-    }
-    
-    st.sidebar.info(strategy_info[strategy])
-    
-    # Create columns for displaying info and map
-    col1, col2 = st.columns([1, 3])
-    
-    # Button to find route
-    if st.sidebar.button("Find Optimal Route", type="primary"):
-        if not location:
-            st.error("Please enter a valid location.")
-            return
-            
-        try:
-            # Initialize optimizer with selected strategy
-            optimizer = ElevationRouteOptimizer(
-                activity_type=activity_type,
-                location=location,
-                distance_km=distance_km,
-                strategy=strategy
-            )
-            
-            # Fetch network and add elevation data
-            with st.spinner("Fetching network and elevation data..."):
-                optimizer.fetch_network()
-            
-            # Find optimal route
-            with st.spinner(f"Finding optimal route using {strategy} strategy..."):
-                route, stats = optimizer.find_optimal_route()
-            
-            if route is None:
-                st.error("Could not find a suitable route. Try adjusting parameters.")
+        activity_type = st.sidebar.radio(
+            "Select activity type:",
+            options=["cycling", "running"],
+            index=0,
+            key="activity_type"
+        )
+        
+        # Dynamic distance range based on activity type
+        if activity_type == "running":
+            min_distance = 3
+            max_distance = 50
+            default_distance = 10
+        else:  # cycling
+            min_distance = 5
+            max_distance = 100
+            default_distance = 25
+        
+        # Distance selection with dynamic range
+        distance_km = st.sidebar.slider(
+            "Route distance (km):",
+            min_value=min_distance,
+            max_value=max_distance,
+            value=default_distance,
+            step=DISTANCE_STEP,
+            help="Select your desired route distance in kilometers",
+            key="distance_km"
+        )
+        
+        # Add algorithm strategy selection
+        strategy = st.sidebar.selectbox(
+            "Route finding strategy:",
+            options=["greedy", "optimized", "thorough"],
+            index=1,  # Default to optimized
+            help="Select algorithm strategy: greedy (fastest), optimized (balanced), or thorough (best quality but slowest)"
+        )
+        
+        # Add strategy descriptions
+        strategy_info = {
+            "greedy": "Fastest option (15-30 seconds). Produces good routes by incrementally building a path that prioritizes uphill segments.",
+            "optimized": "Balanced option (1-3 minutes). Uses intelligent sampling to find high-quality routes while maintaining reasonable performance.",
+            "thorough": "Highest quality option (5-15+ minutes). Extensively searches for the optimal route with maximum elevation gain."
+        }
+        
+        st.sidebar.info(strategy_info[strategy])
+        
+        # Create columns for displaying info and map
+        col1, col2 = st.columns([1, 3])
+        
+        # Button to find route
+        if st.sidebar.button("Find Optimal Route", type="primary", key="find_route_button"):
+            if not location:
+                st.error("Please enter a valid location.")
                 return
                 
-            # Display route statistics
-            with col1:
-                st.subheader("Route Statistics")
-                st.metric("Distance", f"{stats['length_km']:.2f} km")
-                st.metric("Elevation Gain", f"{stats['elevation_gain_m']:.0f} m")
-                st.metric("Elevation Loss", f"{stats['elevation_loss_m']:.0f} m")
+            try:
+                # Initialize optimizer with selected strategy
+                optimizer = ElevationRouteOptimizer(
+                    activity_type=activity_type,
+                    location=location,
+                    distance_km=distance_km,
+                    strategy=strategy
+                )
                 
-                # Calculate and display average grade
-                if stats['length_km'] > 0:
-                    avg_grade = stats['elevation_gain_m'] / (stats['length_km'] * 1000) * 100
-
-                    st.metric("Average Grade", f"{avg_grade:.1f}%")
+                # Fetch network and add elevation data
+                with st.spinner("Fetching network and elevation data..."):
+                    optimizer.fetch_network()
                 
-                # Display quality score
-                quality_score = stats.get('quality_score', 0)
-
-                # Scale the score to a range of 1-10 legs
-                # Assuming maximum quality score might be around 50-60
-                # Adjust the scaling factor based on your actual observed range
-                max_quality_score = 60  # Adjust based on your data
-                leg_count = max(1, min(5, int(quality_score / max_quality_score * 5) + 1))
+                # Find optimal route
+                with st.spinner(f"Finding optimal route using {strategy} strategy..."):
+                    route, stats = optimizer.find_optimal_route()
                 
-                # Create a string of leg emojis
-                legs_display = "🦵" * leg_count
+                if route is None:
+                    st.error("Could not find a suitable route. Try adjusting parameters.")
+                    return
+                    
+                # Display route statistics
+                with col1:
+                    st.subheader("Route Statistics")
+                    st.metric("Distance", f"{stats['length_km']:.2f} km")
+                    st.metric("Elevation Gain", f"{stats['elevation_gain_m']:.0f} m")
+                    st.metric("Elevation Loss", f"{stats['elevation_loss_m']:.0f} m")
+                    
+                    # Calculate and display average grade
+                    if stats['length_km'] > 0:
+                        avg_grade = stats['elevation_gain_m'] / (stats['length_km'] * 1000) * 100
+                        st.metric("Average Grade", f"{avg_grade:.1f}%")
+                    
+                    # Display quality score
+                    quality_score = stats.get('quality_score', 0)
+                    leg_count = max(1, min(5, int(quality_score / 60 * 5) + 1))
+                    legs_display = "🦵" * leg_count
+                    st.markdown(f"**Route Quality:** {legs_display}")            
                 
-                # Display the quality as legs with the actual score in parentheses
-                st.markdown(f"**Route Quality:** {legs_display}")            
-            # Visualize route
-            with col2:
-                st.subheader("Route Map")
-                map_obj = optimizer.visualize_route()
-                folium_static(map_obj, width=800)
-                
-                # Add explanatory text
-                st.markdown("""
-                    **Map Legend:**
-                    - Green segments: Uphill (positive grade)
-                    - Yellow segments: Flat (near zero grade)
-                    - Red segments: Downhill (negative grade)
-                    - The darker the color, the steeper the grade
-                """)
-                
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-            st.exception(e)
+                # Visualize route
+                with col2:
+                    st.subheader("Route Map")
+                    map_obj = optimizer.visualize_route()
+                    folium_static(map_obj, width=800, height=500)
+                    
+                    # Add option to download map as HTML
+                    if st.button("Export Map as HTML"):
+                        html_data = map_obj._repr_html_()
+                        st.download_button(
+                            "Download HTML Map",
+                            html_data,
+                            file_name=f"route_map_{location.replace(' ', '_')}.html",
+                            mime="text/html"
+                        )
+                    
+                    # Add explanatory text
+                    st.markdown("""
+                        **Map Legend:**
+                        - Green segments: Uphill (positive grade)
+                        - Yellow segments: Flat (near zero grade)
+                        - Red segments: Downhill (negative grade)
+                        - The darker the color, the steeper the grade
+                    """)
+                    
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
+                st.exception(e)
     
-    # Add additional information
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(
-        """
-        ### About
-        This application uses:
-        - OpenStreetMap (OSM) for street networks
-        - Open Topo Data for elevation data
-        - NetworkX for route optimization
-        - Streamlit and Folium for visualization
+    # Steep Climb Finder Tab
+    with tab2:
+        st.markdown(
+            """
+            ## Steep Climb Finder
+            Discover significant uphill segments within a specified radius. Perfect for finding the steepest, 
+            most challenging climbs near you for training.
+            """
+        )
         
-        The algorithm attempts to find routes with maximum elevation gain 
-        while keeping close to your desired distance.
-        """
-    )
+        # Create sidebar for steep climb inputs
+        st.sidebar.header("Climb Finder Parameters")
+        
+        # Location input
+        climb_location = st.sidebar.text_input(
+            "Starting location:",
+            value="Quai Gustave Ador 23, 1207 Genève",
+            help="Enter an address, city, or place name",
+            key="climb_location"
+        )
+        
+        # Search radius
+        radius_km = st.sidebar.slider(
+            "Search radius (km):",
+            min_value=1,
+            max_value=20,
+            value=5,
+            step=1,
+            help="Radius around the starting point to search for climbs",
+            key="radius_km"
+        )
+        
+        # Advanced parameters
+        with st.sidebar.expander("Advanced Parameters"):
+            min_climb_length_m = st.slider(
+                "Minimum climb length (m):",
+                min_value=100,
+                max_value=1000,
+                value=200,
+                step=50,
+                help="Minimum length of a climb section to be considered"
+            )
+            
+            min_elevation_gain_m = st.slider(
+                "Minimum elevation gain (m):",
+                min_value=20,
+                max_value=100,
+                value=30,
+                step=5,
+                help="Minimum elevation gain for a climb to be considered significant"
+            )
+            
+            min_avg_grade = st.slider(
+                "Minimum average grade (%):",
+                min_value=3.0,
+                max_value=15.0,
+                value=5.0,
+                step=0.5,
+                help="Minimum average grade for a climb to be considered"
+            )
+            
+            max_results = st.slider(
+                "Maximum results:",
+                min_value=5,
+                max_value=20,
+                value=10,
+                step=1,
+                help="Maximum number of climbs to return"
+            )
+        
+        # Create columns for climb info and map
+        climb_col1, climb_col2 = st.columns([1, 3])
+        
+        # Button to find climbs
+        if st.sidebar.button("Find Steep Climbs", type="primary", key="find_climbs_button"):
+            if not climb_location:
+                st.error("Please enter a valid location.")
+                return
+                
+            try:
+                # Initialize steep climb finder
+                climb_finder = SteepClimbFinder(
+                    location=climb_location,
+                    radius_km=radius_km,
+                    min_climb_length_m=min_climb_length_m,
+                    min_elevation_gain_m=min_elevation_gain_m,
+                    min_avg_grade=min_avg_grade,
+                    max_results=max_results
+                )
+                
+                # Fetch network and add elevation data
+                with st.spinner("Fetching network and elevation data..."):
+                    climb_finder.fetch_network()
+                
+                # Find steep climbs
+                with st.spinner("Analyzing network for steep climbs..."):
+                    climbs = climb_finder.find_climbs()
+                
+                if not climbs:
+                    st.warning("No significant climbs found that match your criteria. Try adjusting parameters or choosing a different location.")
+                    return
 
+                with climb_col2:
+                    st.subheader("Climb Map")
+                    
+                    # Generate the map visualization
+                    climb_map = climb_finder.visualize_climbs()
+                    
+                    # If a climb is selected, center the map on it
+                    if hasattr(st.session_state, 'selected_climb_index') and st.session_state.selected_climb_index < len(climbs):
+                        selected_climb = climbs[st.session_state.selected_climb_index]
+                        # Find midpoint to center on
+                        mid_idx = len(selected_climb.geometry) // 2
+                        if mid_idx < len(selected_climb.geometry):
+                            # Update map center to selected climb
+                            climb_map.location = selected_climb.geometry[mid_idx]
+                            # You might need to adjust zoom level too
+                            climb_map.zoom_start = 15
+                            
+                    # Show the map
+                    folium_static(climb_map, width=800, height=600)
+                    
+                # Create a variable to track selected climb for map centering
+                # if 'selected_climb_index' not in st.session_state:
+                #     st.session_state.selected_climb_index = 0
+                
+                # Display visualization controls above the columns
+                climb_sort = st.radio(
+                    "Sort climbs by:",
+                    options=["Score (default)", "Length", "Grade", "Elevation Gain"],
+                    horizontal=True,
+                    key="climb_sort"
+                )
+                
+                # Sort climbs based on selection
+                if climb_sort == "Length":
+                    climbs.sort(key=lambda x: x.length_m, reverse=True)
+                elif climb_sort == "Grade":
+                    climbs.sort(key=lambda x: x.avg_grade, reverse=True)
+                elif climb_sort == "Elevation Gain":
+                    climbs.sort(key=lambda x: x.elevation_gain_m, reverse=True)
+
+                # "Score" is default, already sorted
+                
+                # Export options
+                export_format = st.selectbox(
+                    "Export climbs as:",
+                    options=["None", "GPX", "CSV", "GeoJSON"],
+                    index=0,
+                    key="export_format"
+                )
+                
+                if export_format != "None":
+                    export_data = prepare_export_data(climbs, export_format)
+                    st.download_button(
+                        f"Download {export_format} file",
+                        export_data,
+                        file_name=f"steep_climbs_{climb_location.replace(' ', '_')}.{export_format.lower()}",
+                        mime=get_mime_type(export_format)
+                    )
+                
+                # Display climb statistics
+                with climb_col1:
+                    st.subheader("Climb Statistics")
+                    
+                    # Summary table of all climbs
+                    climb_data = []
+                    for i, climb in enumerate(climbs):
+                        climb_data.append({
+                            "Rank": i+1,
+                            "Length (m)": f"{climb.length_m:.0f}",
+                            "Gain (m)": f"{climb.elevation_gain_m:.0f}",
+                            "Avg Grade (%)": f"{climb.avg_grade:.1f}",
+                            "Max Grade (%)": f"{climb.max_grade:.1f}"
+                        })
+                    
+                    st.dataframe(
+                        climb_data, 
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    
+                    st.markdown("---")
+                    st.markdown("### Detailed Climb Information")
+                    
+                    # Create an expandable section for each climb
+                    for i, climb in enumerate(climbs):
+                        with st.expander(f"Climb #{i+1}: {climb.length_m:.0f}m @ {climb.avg_grade:.1f}%"):
+                            st.metric("Distance", f"{climb.length_m:.0f} m")
+                            st.metric("Elevation Gain", f"{climb.elevation_gain_m:.0f} m")
+                            st.metric("Average Grade", f"{climb.avg_grade:.1f}%")
+                            st.metric("Maximum Grade", f"{climb.max_grade:.1f}%")
+                            
+                            # Calculate difficulty score based on length, grade, and elevation gain
+                            difficulty_score = climb.get_score()
+                            scaled_score = min(5, max(1, int(difficulty_score / 200)))
+                            fire_emoji = "🔥" * scaled_score
+                            st.markdown(f"**Difficulty:** {fire_emoji}")
+                            
+                            # Add button to center map on this climb
+                            if st.button(f"Center map on this climb", key=f"center_climb_{i}"):
+                                st.session_state.selected_climb_index = i
+                                # You may need to set a flag to trigger map redraw
+                                st.session_state.redraw_map = True
+            except Exception as e:
+                # Handle the exception
+                st.error(f"An error occurred: {str(e)}")
 if __name__ == "__main__":
     main()

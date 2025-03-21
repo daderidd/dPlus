@@ -45,6 +45,9 @@ elevation-data/
 *.tif
 *.hgt
 
+# Jupyter Notebooks
+ssrrc/
+
 # Docker volumes
 docker-volume/
 
