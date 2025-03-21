@@ -103,9 +103,7 @@ streamlit run app.py  # or streamlit run elevation_route_finder.py
 ## 📊 Elevation Data Sources
 
 The application uses elevation data from:
-- EU-DEM 25m (Europe)
-- SRTM 30m (Global)
-- Local datasets where available
+- EU-DEM 25m (Europe) (Global not yet supported)
 
 For best results, consider setting up a local Open Topo Data server with detailed regional DEM data.
 

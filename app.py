@@ -16,7 +16,7 @@ from typing import Dict, Tuple, List, Optional, Union, Any
 MIN_DISTANCE_KM = 5
 MAX_DISTANCE_KM = 150
 DISTANCE_STEP = 5
-SEARCH_RADIUS_BUFFER = 1.5  # Buffer multiplier for search radius
+SEARCH_RADIUS_BUFFER = 1.3  # Buffer multiplier for search radius
 OPENTOPODATA_URL = "https://api.opentopodata.org/v1/eudem25m?locations={locations}"
 BATCH_SIZE = 400
 API_PAUSE = 0.1  # Pause between API calls in seconds
@@ -76,11 +76,11 @@ class ElevationRouteOptimizer:
         try:
             # Determine search radius with dynamic scaling
             if self.distance_km < 10:
-                buffer_factor = 1.8  # Larger buffer for short routes
+                buffer_factor = 1.4  # Larger buffer for short routes
             elif self.distance_km < 20:
-                buffer_factor = 1.4
-            elif self.distance_km < 50:
                 buffer_factor = 1.2
+            elif self.distance_km < 50:
+                buffer_factor = 1
             else:
                 buffer_factor = 0.9  # Smaller buffer for longer routes
                 
