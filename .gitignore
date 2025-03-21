@@ -1,0 +1,52 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env
+.venv
+
+# Local development settings
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Streamlit specific
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# Cache directories for OSMnx
+cache/
+.cache/
+osmnx_cache/
+
+# Temporary network data storage
+*.graphml
+*.osm
+
+# Exported data and maps
+*.gpx
+*.csv
+*.geojson
+*.html
+!index.html
+
+# Environment-specific files
+.env.local
+.env.development
+.env.production
+
+# Elevation data files (potentially large)
+elevation-data/
+*.tif
+*.hgt
+
+# Docker volumes
+docker-volume/
+
+# Log files
+*.log

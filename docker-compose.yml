@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  # Main Streamlit application
+  app:
+    build: .
+    container_name: elevation-route-finder
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+      - ~/.cache/osmnx:/root/.cache/osmnx
+    environment:
+      - ELEVATION_API_URL=http://elevation-api:5001/v1/eudem25m?locations={locations}
+    depends_on:
+      - elevation-api
+    restart: unless-stopped
+    command: streamlit run app.py
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Local Elevation API service
+  elevation-api:
+    image: ghcr.io/ajnisbet/opentopodata:latest
+    container_name: elevation-api
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./elevation-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  elevation-data:
+    external: true

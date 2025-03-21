@@ -1,0 +1,32 @@
+name: d+
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip>=23.0
+  - numpy>=1.22.0
+  - pandas<3,>=1.4.0
+  - scipy>=1.8.0
+  - matplotlib>=3.5.0
+  - networkx>=2.6.3
+  - folium>=0.13.0
+  - geopy>=2.2.0
+  - pyproj>=3.3.0
+  - shapely>=1.8.0
+  - geopandas>=0.10.2
+  - rasterio>=1.2.10
+  - pip:
+    - streamlit>=1.42.0
+    - streamlit-folium>=0.11.0
+    - osmnx==2.0.1  # Explicitly pinned version for compatibility
+    - requests>=2.28.0
+    - beautifulsoup4>=4.11.0
+    - tqdm>=4.64.0
+    - typing-extensions>=4.3.0
+    - pydeck>=0.8.0
+    - altair>=4.2.0
+    - black>=23.1.0  # Development dependency for code formatting
+    - flake8>=6.0.0  # Development dependency for linting
+    - pytest>=7.2.0  # Development dependency for testing
+    - mypy>=1.0.0    # Development dependency for type checking
